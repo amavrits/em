@@ -174,21 +174,35 @@ a fork of somebody's mixture library.
 ## Examples
 
 ```bash
-uv run python examples/mixture_1d.py          # 1-D density mixture
-uv run python examples/mixture_2d.py          # 2-D density mixture
+uv run python examples/mixture_1d.py          # 1-D density mixture, real data
+uv run python examples/mixture_2d.py          # 2-D density mixture, real data
 uv run python examples/mixture_regression.py  # mixture of regressions
 ```
 
-Each writes a PNG next to itself; pass `--show` to open a window instead.
+Each writes a PNG next to itself; pass `--show` to open a window instead. The
+two density examples run on real benchmark datasets, embedded in
+`examples/datasets.py` so nothing is downloaded at run time.
 
-- **`mixture_1d.py`** fits a three-component normal mixture and plots the
-  fitted density, AIC/BIC model selection, the log-likelihood trace, and the
-  responsibility curves. All three components come back to two decimals.
-- **`mixture_2d.py`** does the same in two dimensions with three correlated
-  Gaussians, including one with a strong negative correlation. The panels are
-  the points with 2σ ellipses, AIC/BIC, the trace, and the fitted density as
-  filled contours. Recovers `[-2.5, 1.0]`, `[3.0, 2.5]` and `[0.5, -3.5]` along
-  with their covariances.
+- **`mixture_1d.py`** fits the **galaxy velocities** — 82 radial velocities from
+  the Corona Borealis region (Postman, Huchra and Geller 1986; Roeder 1990),
+  the standard univariate mixture benchmark, where the number of superclusters
+  is the scientific question and published answers run from three to seven.
+  Panels: the fitted density over a rug of the data, AIC/BIC model selection,
+  the log-likelihood trace, and the responsibility curves. BIC picks **3**
+  groups at **9.71**, **21.4** and **33.0** (×1000 km/s) with weights 0.09 /
+  0.88 / 0.04 — the classic three-supercluster reading. AIC keeps falling past
+  that, and the fits show why: from five groups on, EM parks a narrow spike on
+  two or three points (σ down to 0.04) and buys likelihood without finding
+  structure. That contrast is the point of the panel.
+- **`mixture_2d.py`** fits the **Old Faithful** eruptions — 272 (duration,
+  waiting time) pairs in minutes (Azzalini and Bowman 1990). The two regimes
+  are correlated *within* each group, so a full covariance per component is
+  doing real work. The panels are the points with 2σ ellipses, AIC/BIC, the
+  trace, and the fitted density as filled contours. BIC picks **2** groups:
+  long eruptions at **(4.29 min, 79.97 min)** with weight 0.64 and r=0.38,
+  short ones at **(2.04 min, 54.48 min)** with weight 0.36 and r=0.29. A third
+  group only shaves the short-eruption cloud in two, and BIC climbs from
+  there.
 - **`mixture_regression.py`** hides two crossing lines (`y = 3x` and `y = -3x`,
   σ=0.7) in one X-shaped scatter. A single regression through all of it finds
   slope **−0.028** and σ=**5.31** — the two lines cancel, and the fit is
