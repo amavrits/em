@@ -171,6 +171,93 @@ a fork of somebody's mixture library.
   For `d > 1` use `multivariate-normal`, which carries the covariance
   parameterization the univariate families do not have.
 
+## Why this implementation
+
+**It fits what `sklearn.mixture` will not.** The component family is the reason
+to reach for `em`. sklearn fits Gaussians; here a component is any log-density
+you can write as a Python function, alongside seven built-ins — a univariate
+normal, four non-Gaussian densities, a full multivariate normal, and a
+conditional regression family that turns EM into clusterwise regression. Heavy tails,
+counts, positive-only data, a truncated or censored support, a likelihood
+specific to your instrument: each is a dozen lines rather than a fork of
+somebody's mixture library.
+
+**The M-step is solved, not searched.** Every built-in carries a *weighted* MLE
+in closed form — exact for `normal`, `lognormal`, `exponential` and `poisson`,
+Newton on the shape for `gamma`, a Cholesky factorization for
+`multivariate-normal`, weighted least squares for `linear-regression`. A
+generic optimizer only appears for a custom callable, and even then it is
+seeded from a pooled fit of the whole sample rather than from `init_params`
+directly, so no component starts from a wild guess.
+
+**The E-step is specialized.** `scipy.special.logsumexp` carries machinery this
+loop never uses — complex input, `b` weights, an optional sign return, a masked
+search for the largest real part. The row-wise version in `em/em.py` drops all
+of it and measures **2.5–2.8× faster** on the shapes an E-step actually sees
+(20k×3 through 100k×4). It runs once per iteration per restart, so on the
+large-`n` cases it is a large share of the total.
+
+**Parameter counts are honest.** A `d`-dimensional covariance is stored as its
+lower triangle, so a component has exactly `d + d(d+1)/2` parameters and
+`n_free_params()` counts free ones rather than the cells of a padded square
+matrix. AIC and BIC are computed off that number, which is what makes the
+model-selection panels in the examples trustworthy.
+
+**Reproducible by construction.** `seed` fixes the restarts, so a given
+`(data, seed, n_init)` always gives the same fit — both example scripts are
+bit-identical across runs. `converged_`, `n_iter_` and `loglike_history_`
+record what the fit did, and `e_step`/`m_step` are public, so a suspicious
+result can be stepped through by hand.
+
+**Small surface.** ~1,000 lines over two modules, depending on numpy, scipy and
+tqdm. No pandas, no sklearn at runtime; matplotlib and scikit-learn live in the
+`examples` and `bench` groups.
+
+### Benchmark on the example datasets
+
+`benchmarks/on_examples.py` runs the head-to-head on the real data the examples
+fit, where there is no ground truth to recover, so the questions are whether
+the two implementations reach the *same* answer and what that costs:
+
+```bash
+uv run --group bench python benchmarks/on_examples.py
+```
+
+Matched settings (`tol=1e-8`, `reg=1e-6`, `n_init=24`, k-means++ seeding, full
+covariance), best of 3, on an M-series laptop:
+
+| dataset | shape | groups by BIC | BIC | mean loglike | labels agree | one fit at chosen `k` | whole BIC sweep |
+|---|---|---|---|---|---|---|---|
+| galaxy velocities | 82 × 1 | **3** / **3** | 441.612 / 441.612 | −2.4778 / −2.4778 | 1.000 | **0.018 s** / 0.059 s | **1.00 s** / 3.66 s |
+| Old Faithful | 272 × 2 | **2** / **2** | 2322.19 / 2322.19 | −4.1554 / −4.1554 | 1.000 | **0.027 s** / 0.029 s | 6.30 s / **4.88 s** |
+
+Cells are `em` / sklearn. The first four columns are the ones that matter and
+they are ties: both implementations choose the same component count by BIC,
+land on the same log-likelihood to six figures, and produce **identical
+labellings** — adjusted Rand 1.000, not 0.999. These are the same two fits.
+
+The timings split by dimension, and the per-`k` breakdown says why:
+
+- **1-D is `em`'s case.** On the galaxy velocities it is 2.5–4× faster at every
+  candidate `k`. The univariate M-step is closed-form arithmetic on two scalars
+  per component, with no matrix work to amortize.
+- **2-D is a draw at the `k` you keep, and a loss past it.** On Old Faithful
+  `em` wins at `k ≤ 3` (0.004/0.027/0.44 s against 0.008/0.028/0.48 s) and
+  loses from `k = 4` on (1.76/2.01/2.12 s against 1.42/1.40/1.60 s), which is
+  what drags the sweep. The M-step loops over components in Python and takes a
+  Cholesky per component per iteration, where sklearn vectorizes the covariance
+  update across all of them; at n=272 that loop overhead is the whole
+  difference. The sweep total is therefore dominated by the four-to-six-group
+  fits — exactly the ones BIC rejects and nobody keeps.
+
+So: `em` is faster on the fit you actually run in both examples, and slower
+only when fitting 2-D models the data does not support. The synthetic
+benchmark in [Benchmark](#benchmark) covers the large-`n` regime, where it wins
+every case.
+
+`mixture_regression.py` has no row here because there is nothing to compare
+against — `sklearn.mixture` does not fit mixtures of regressions.
+
 ## Examples
 
 ```bash
@@ -179,40 +266,93 @@ uv run python examples/mixture_2d.py          # 2-D density mixture, real data
 uv run python examples/mixture_regression.py  # mixture of regressions
 ```
 
-Each writes a PNG next to itself; pass `--show` to open a window instead. The
-two density examples run on real benchmark datasets, embedded in
-`examples/datasets.py` so nothing is downloaded at run time.
+Each writes the PNG below next to itself; pass `--show` to open a window
+instead. The two density examples run on real benchmark datasets, embedded in
+`examples/datasets.py` so nothing is downloaded at run time. Plotting is not a
+runtime dependency; matplotlib lives in the `examples` dependency group, which
+`uv sync` installs by default.
 
-- **`mixture_1d.py`** fits the **galaxy velocities** — 82 radial velocities from
-  the Corona Borealis region (Postman, Huchra and Geller 1986; Roeder 1990),
-  the standard univariate mixture benchmark, where the number of superclusters
-  is the scientific question and published answers run from three to seven.
-  Panels: the fitted density over a rug of the data, AIC/BIC model selection,
-  the log-likelihood trace, and the responsibility curves. BIC picks **3**
-  groups at **9.71**, **21.4** and **33.0** (×1000 km/s) with weights 0.09 /
-  0.88 / 0.04 — the classic three-supercluster reading. AIC keeps falling past
-  that, and the fits show why: from five groups on, EM parks a narrow spike on
-  two or three points (σ down to 0.04) and buys likelihood without finding
-  structure. That contrast is the point of the panel.
-- **`mixture_2d.py`** fits the **Old Faithful** eruptions — 272 (duration,
-  waiting time) pairs in minutes (Azzalini and Bowman 1990). The two regimes
-  are correlated *within* each group, so a full covariance per component is
-  doing real work. The panels are the points with 2σ ellipses, AIC/BIC, the
-  trace, and the fitted density as filled contours. BIC picks **2** groups:
-  long eruptions at **(4.29 min, 79.97 min)** with weight 0.64 and r=0.38,
-  short ones at **(2.04 min, 54.48 min)** with weight 0.36 and r=0.29. A third
-  group only shaves the short-eruption cloud in two, and BIC climbs from
-  there.
-- **`mixture_regression.py`** hides two crossing lines (`y = 3x` and `y = -3x`,
-  σ=0.7) in one X-shaped scatter. A single regression through all of it finds
-  slope **−0.028** and σ=**5.31** — the two lines cancel, and the fit is
-  nothing. The two-component mixture recovers **+3.003** and **−2.996** with
-  σ≈**0.69**, and assigns 97.1% of the points to the right line. The fourth
-  panel maps assignment *certainty*, which is where the crossing shows up:
-  near the origin no model could tell the lines apart.
+### `mixture_1d.py` — galaxy velocities
 
-Plotting is not a runtime dependency; matplotlib lives in the `examples`
-dependency group, which `uv sync` installs by default.
+![EM on the galaxy velocities](examples/mixture_1d.png)
+
+82 radial velocities from the Corona Borealis region (Postman, Huchra and
+Geller 1986; Roeder 1990), the standard univariate mixture benchmark.
+Superclusters are separated by voids, so velocity arrives in clumps — and *how
+many* clumps is the scientific question, with published answers running from
+three to seven. There is no true answer to recover, which makes it a harder
+test than synthetic data.
+
+```
+EM(normal) with 3 groups, converged
+  group 0: weight=0.8781, mu=21.4, sigma=2.195
+  group 2: weight=0.0854, mu=9.71, sigma=0.4225
+  group 1: weight=0.0366, mu=33.04, sigma=0.9217
+  mean loglike = -2.477795
+```
+
+BIC picks **3** groups — the classic three-supercluster reading. AIC keeps
+falling past that, and the fits show why: from five groups on, EM parks a
+narrow spike on two or three points (σ down to 0.04, and 0.001 at seven groups)
+and buys likelihood without finding structure. That contrast is the point of
+the model-selection panel, and it is the honest caveat on any AIC curve that
+keeps descending.
+
+The four panels are the fitted density over a rug of the data, AIC/BIC against
+the number of groups, the log-likelihood trace, and the responsibility curves —
+the soft assignment EM actually produces, before `classify()` takes an argmax.
+
+### `mixture_2d.py` — Old Faithful
+
+![EM on the Old Faithful eruptions](examples/mixture_2d.png)
+
+272 eruptions of the Old Faithful geyser, each an (eruption duration, waiting
+time until the next eruption) pair in minutes (Azzalini and Bowman 1990). The
+geyser has two regimes — short eruption then short wait, long then long — and
+the two variables stay correlated *within* each regime, so a full covariance
+per component is doing real work that two spherical blobs could not.
+
+```
+EM(multivariate-normal) with 2 groups, converged
+  group 0: weight=0.6441, mu1=4.29, mu2=79.97, cov11=0.17, cov21=0.9406, cov22=36.05
+  group 1: weight=0.3559, mu1=2.036, mu2=54.48, cov11=0.06917, cov21=0.4352, cov22=33.7
+  mean loglike = -4.155382
+```
+
+BIC picks **2** groups: long eruptions at (4.29 min, 79.97 min) with weight
+0.64 and within-group correlation r=0.38, short ones at (2.04 min, 54.48 min)
+with weight 0.36 and r=0.29 — matching the published fit. A third group only
+shaves the short-eruption cloud in two, and BIC climbs from there.
+
+Panels: the points with 2σ covariance ellipses, AIC/BIC, the trace, and the
+fitted density as filled contours.
+
+### `mixture_regression.py` — two crossing lines
+
+![EM on a mixture of regressions](examples/mixture_regression.png)
+
+Synthetic, because the point is a controlled failure: two lines (`y = 3x` and
+`y = -3x`, σ=0.7) hidden in one X-shaped scatter. A single regression through
+all of it finds slope **−0.028** and σ=**5.31** — the two lines cancel and the
+fit is nothing.
+
+```
+single regression (n_groups=1):
+   intercept=+0.020, slope=-0.028, sigma=5.309
+
+EM(linear-regression) with 2 groups, converged
+  group 1: weight=0.5032, intercept=0.04102, beta1=-2.996, sigma=0.6924
+  group 0: weight=0.4968, intercept=0.00969, beta1=3.003, sigma=0.6951
+  mean loglike = -1.691425
+```
+
+The two-component mixture recovers **+3.003** and **−2.996** with σ≈**0.69**,
+and assigns 97.1% of the points to the right line. The fourth panel maps
+assignment *certainty*, which is where the crossing shows up: near the origin
+no model could tell the lines apart, and the mixture says so rather than
+guessing.
+
+`sklearn.mixture` has no counterpart for this example at all.
 
 ## Compared to scikit-learn
 
@@ -230,7 +370,7 @@ below); they differ in what they will fit at all.
 | Warm start, explicit initial means | no | yes |
 | `Pipeline` / `GridSearchCV` | no | yes |
 | AIC / BIC | yes | yes |
-| Fit time | faster in every case benchmarked below | baseline |
+| Fit time | faster in all six synthetic cases below and on 1-D real data; mixed on small 2-D | baseline |
 
 Use sklearn for a Gaussian mixture, especially inside an existing pipeline or
 when you need constrained covariances. Use `em` when the components are not
@@ -238,6 +378,12 @@ Gaussian, when you want to write the density yourself, or when you are fitting
 a mixture of regressions.
 
 ## Benchmark
+
+There are two benchmark scripts.
+[Benchmark on the example datasets](#benchmark-on-the-example-datasets) covers
+the real data, where no truth is known and the question is agreement. This one
+covers synthetic mixtures, where the true means *are* known and recovery is
+measurable.
 
 `benchmarks/vs_sklearn.py` runs `em` head-to-head against
 `sklearn.mixture.GaussianMixture`, the standard reference implementation. Both
@@ -251,7 +397,8 @@ uv run --group bench python benchmarks/vs_sklearn.py
 ```
 
 scikit-learn lives in the `bench` group, which `uv sync` does not install by
-default. Six cases, `n_init=5`, best-of-2 timing, on an M-series laptop:
+default. Six cases, all `n = 20,000` or more, `n_init=5`, best-of-2 timing, on
+an M-series laptop:
 
 | case | mean loglike | mean abs error | adjusted Rand | fit time |
 |---|---|---|---|---|
@@ -262,7 +409,10 @@ default. Six cases, `n_init=5`, best-of-2 timing, on an M-series laptop:
 | 5-D (n=20k, k=4) | tie | **em** | tie | **em** |
 | large 2-D (n=100k, k=4) | tie | sklearn | sklearn | **em** |
 
-Fit time, `em` / sklearn: median **0.74x**, range 0.07–0.89x.
+Fit time, `em` / sklearn: median **0.74x**, range 0.07–0.89x. This is the
+large-`n` regime, where the per-iteration array work dominates and the Python
+loop over components does not; on the 272-point 2-D example that ordering
+reverses at four or more groups.
 
 The log-likelihood column is the point: the two agree to five or six figures
 everywhere, and where they part `em` is ahead. Neither implementation is

@@ -222,3 +222,5 @@ __marimo__/
 .env
 *.xml
 *.png
+# The example figures are the README, so they are tracked despite the rule above.
+!examples/*.png
